@@ -1,0 +1,192 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <errno.h>
+#include <bpf/libbpf.h>
+#include <bpf/bpf.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
+
+#include "../../phase2/bpf/phase2.h"
+#include "../common/protocol.h"
+#include "../common/crypto.h"
+
+#define SERVER_PORT 9090
+#define SERVER_IP "127.0.0.1"
+
+static volatile bool exiting = false;
+
+#define MAX_VALID_PATHS 1024
+static __u64 valid_paths[MAX_VALID_PATHS];
+static int num_valid_paths = 0;
+
+static unsigned char prev_token[SHA256_MAC_LEN] = "INITIAL";
+static int sockfd = -1;
+
+static void connect_to_verifier() {
+    if (sockfd >= 0) close(sockfd);
+    sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in servaddr;
+    memset(&servaddr, 0, sizeof(servaddr));
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_port = htons(SERVER_PORT);
+    inet_pton(AF_INET, SERVER_IP, &servaddr.sin_addr);
+    
+    if (connect(sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr)) != 0) {
+        close(sockfd);
+        sockfd = -1;
+    }
+}
+
+static void send_attest_record(struct attest_record *rec) {
+    if (sockfd < 0) connect_to_verifier();
+    if (sockfd >= 0) {
+        if (send(sockfd, rec, sizeof(*rec), 0) < 0) {
+            close(sockfd);
+            sockfd = -1;
+        }
+    }
+}
+
+static bool is_valid(__u64 path_id) {
+    if (path_id == 0) return true;
+    for (int i = 0; i < num_valid_paths; i++) {
+        if (valid_paths[i] == path_id) return true;
+    }
+    return false;
+}
+
+static void load_valid_paths(const char *filename) {
+    FILE *f = fopen(filename, "r");
+    if (!f) {
+        fprintf(stderr, "Could not open %s\n", filename);
+        return;
+    }
+    __u64 pid;
+    while (fscanf(f, "%llx", &pid) == 1 && num_valid_paths < MAX_VALID_PATHS) {
+        valid_paths[num_valid_paths++] = pid;
+    }
+    fclose(f);
+    printf("Loaded %d valid paths from %s\n", num_valid_paths, filename);
+}
+
+static void sig_handler(int sig) { exiting = true; }
+
+struct edge_key { __u32 src; __u32 dst; };
+static void load_edge_weights(int map_fd) {
+    FILE *f = fopen("../../phase2/user/cfg_edges.json", "r");
+    if (!f) { fprintf(stderr, "Failed to open cfg_edges.json\n"); return; }
+    char line[512]; unsigned int src = 0, dst = 0; unsigned long long weight = 0;
+    struct edge_key key; __u64 val; int loaded = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, "\"src\":")) { char *p = strchr(line, ':'); if (p) sscanf(p + 1, " %u", &src); }
+        else if (strstr(line, "\"dst\":")) { char *p = strchr(line, ':'); if (p) sscanf(p + 1, " %u", &dst); }
+        else if (strstr(line, "\"weight\":")) {
+            char *p = strchr(line, ':');
+            if (p) {
+                sscanf(p + 1, " %llu", &weight);
+                key.src = src; key.dst = dst; val = weight;
+                bpf_map_update_elem(map_fd, &key, &val, BPF_ANY);
+                loaded++; src = dst = weight = 0;
+            }
+        }
+    }
+    fclose(f); printf("Loaded %d edge weights into BPF map.\n", loaded);
+}
+
+static struct bpf_link *attach_prog(struct bpf_object *obj, const char *name) {
+    struct bpf_program *prog = bpf_object__find_program_by_name(obj, name);
+    if (!prog) return NULL;
+    struct bpf_link *link = bpf_program__attach(prog);
+    if (libbpf_get_error(link)) { fprintf(stderr, "Warning: failed to attach '%s'\n", name); return NULL; }
+    return link;
+}
+
+static int handle_event(void *ctx, void *data, size_t data_sz) {
+    const struct event *e = data;
+    
+    __u64 reported_path_id = e->path_id;
+   
+    
+    if (getenv("INVALID_PATH")) reported_path_id ^= 0x1234;
+    
+    if (!is_valid(reported_path_id)) {
+        printf("\033[31m[AGENT ALERT] INVALID PATH: 0x%016llx (EPOCH %llu)\033[0m\n", reported_path_id, e->epoch_id);
+    } else {
+        printf("\033[32m[AGENT OK] Valid path: 0x%016llx (EPOCH %llu)\033[0m\n", reported_path_id, e->epoch_id);
+    }
+    
+
+    struct attest_record rec;
+    rec.epoch_id = e->epoch_id;
+    rec.path_id = reported_path_id;
+    
+    const char *key = "SuperSecretKey";
+    compute_token(key, strlen(key), rec.epoch_id, rec.path_id, prev_token, rec.token);
+    memcpy(prev_token, rec.token, SHA256_MAC_LEN);
+
+    if (getenv("TAMPER_TOKEN")) rec.token[0] ^= 0xFF;
+
+    send_attest_record(&rec);
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    struct bpf_object *obj = NULL;
+    struct bpf_link *links[16] = {0};
+    struct ring_buffer *rb = NULL;
+    int err = 0, map_fd, edge_weights_fd;
+
+    // Pad INITIAL to 32 bytes exactly
+    memset(prev_token, 0, SHA256_MAC_LEN);
+    strcpy((char*)prev_token, "INITIAL");
+    
+    load_valid_paths("../valid_paths.txt");
+    connect_to_verifier();
+
+    obj = bpf_object__open_file("../../phase2/bpf/phase2.bpf.o", NULL);
+    if (!obj || libbpf_get_error(obj)) { fprintf(stderr, "Failed to open BPF object\n"); return 1; }
+    if (bpf_object__load(obj)) { fprintf(stderr, "Failed to load BPF object\n"); goto cleanup; }
+
+    if ((edge_weights_fd = bpf_object__find_map_fd_by_name(obj, "edge_weights_map")) >= 0) {
+        load_edge_weights(edge_weights_fd);
+    }
+
+    const char *prog_names[] = {
+        "handle_start", "handle_end", "handle_edge1", "handle_edge2", "handle_edge3",
+        "handle_edge4", "handle_edge5", "handle_edge6", "handle_libc_read",
+        "handle_libc_write", "handle_libc_recv", "handle_libc_send", "handle_libc_pread",
+        "handle_libc_pwrite"
+    };
+    for(int i = 0; i < 14; i++) links[i] = attach_prog(obj, prog_names[i]);
+
+    if (!links[0] || !links[1]) { fprintf(stderr, "Fatal: could not attach handle_start or handle_end\n"); err = -1; goto cleanup; }
+
+    map_fd = bpf_object__find_map_fd_by_name(obj, "rb");
+    if (map_fd < 0) { err = map_fd; goto cleanup; }
+
+    rb = ring_buffer__new(map_fd, handle_event, NULL, NULL);
+    if (!rb) { err = -1; goto cleanup; }
+
+    signal(SIGINT, sig_handler); signal(SIGTERM, sig_handler);
+    printf("Phase 4 Agent running. Streaming tokens to Verifier...\n");
+
+    while (!exiting) {
+        err = ring_buffer__poll(rb, 100);
+        if (err == -EINTR) { err = 0; break; }
+        if (err < 0) break;
+    }
+
+cleanup:
+    ring_buffer__free(rb);
+    for (int i = 0; i < 14; i++) if(links[i]) bpf_link__destroy(links[i]);
+    bpf_object__close(obj);
+    if (sockfd >= 0) close(sockfd);
+    return err < 0 ? 1 : 0;
+}
