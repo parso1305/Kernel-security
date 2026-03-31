@@ -1,0 +1,44 @@
+{
+  "edges": [
+    {
+      "src": 1,
+      "dst": 2,
+      "weight": 1
+    },
+    {
+      "src": 2,
+      "dst": 3,
+      "weight": 2
+    },
+    {
+      "src": 3,
+      "dst": 4,
+      "weight": 3
+    },
+    {
+      "src": 4,
+      "dst": 5,
+      "weight": 4
+    },
+    {
+      "src": 5,
+      "dst": 6,
+      "weight": 5
+    },
+    {
+      "src": 6,
+      "dst": 7,
+      "weight": 6
+    },
+    {
+      "src": 7,
+      "dst": 14,
+      "weight": 7
+    },
+    {
+      "src": 5,
+      "dst": 14,
+      "weight": 8
+    }
+  ]
+}

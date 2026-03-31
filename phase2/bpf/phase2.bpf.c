@@ -28,13 +28,26 @@ struct {
     __type(value, __u64);
 } path_map SEC(".maps");
 
-/* request_id -> previous instruction pointer */
+struct edge_key {
+    __u32 src;
+    __u32 dst;
+};
+
+/* (prev_probe, curr_probe) -> edge weight */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 524288);
+    __type(key, struct edge_key);
+    __type(value, __u64);
+} edge_weights_map SEC(".maps");
+
+/* request_id -> previous probe_id */
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 65536);
     __type(key,   __u64);
-    __type(value, __u64);
-} last_ip_map SEC(".maps");
+    __type(value, __u32);
+} last_probe_id_map SEC(".maps");
 
 /* ring buffer for userspace events */
 struct {
@@ -47,7 +60,7 @@ volatile __u64 epoch_ctr = 0;
 /* ------------------------------------------------------------------ *
  *  Edge tracking helper
  * ------------------------------------------------------------------ */
-static __always_inline void track_edge(struct pt_regs *ctx)
+static __always_inline void track_edge(struct pt_regs *ctx, __u32 current_probe_id)
 {
     __u64 tid = bpf_get_current_pid_tgid();
 
@@ -56,30 +69,40 @@ static __always_inline void track_edge(struct pt_regs *ctx)
         return;
     __u64 req = *req_ptr;
 
-    __u64 ip = PT_REGS_IP(ctx);
+    /* Debug: emit every probe id so trace_pipe shows distinct sequences */
+    bpf_printk("PROBE: req=%llx id=%u\n", req, current_probe_id);
 
-    /* Debug: emit every edge IP so trace_pipe shows distinct sequences */
-    bpf_printk("EDGE: req=%llx ip=%lx\n", req, ip);
-
-    __u64 *prev_ptr = bpf_map_lookup_elem(&last_ip_map, &req);
+    __u32 *prev_ptr = bpf_map_lookup_elem(&last_probe_id_map, &req);
     if (!prev_ptr) {
-        /* First probe hit for this request — seed the last_ip and return */
-        bpf_map_update_elem(&last_ip_map, &req, &ip, BPF_ANY);
+        /* First probe hit for this request */
+        bpf_printk("FIRST PROBE: req=%llx id=%u\n", req, current_probe_id);
+        bpf_map_update_elem(&last_probe_id_map, &req, &current_probe_id, BPF_ANY);
         return;
     }
-    __u64 prev = *prev_ptr;
+    __u32 prev = *prev_ptr;
 
-    /* Fibonacci / Knuth multiplicative hash of the edge (prev XOR ip) */
-    __u64 weight = (prev ^ ip) * 11400714819323198485ULL;
+    struct edge_key e_key;
+    e_key.src = prev;
+    e_key.dst = current_probe_id;
 
-    __u64 *path_ptr = bpf_map_lookup_elem(&path_map, &req);
-    if (!path_ptr) {
-        bpf_map_update_elem(&path_map, &req, &weight, BPF_ANY);
-    } else {
-        __sync_fetch_and_add(path_ptr, weight);
+    __u64 *weight_ptr = bpf_map_lookup_elem(&edge_weights_map, &e_key);
+    __u64 weight = weight_ptr ? *weight_ptr : 0;
+
+    bpf_printk("prev=%u curr=%u w=%llx\n", prev, current_probe_id, weight);
+    if (!weight) {
+        bpf_printk("MISS: %u -> %u\n", e_key.src, e_key.dst);
     }
 
-    bpf_map_update_elem(&last_ip_map, &req, &ip, BPF_ANY);
+    if (weight > 0) {
+        __u64 *path_ptr = bpf_map_lookup_elem(&path_map, &req);
+        if (!path_ptr) {
+            bpf_map_update_elem(&path_map, &req, &weight, BPF_ANY);
+        } else {
+            __sync_fetch_and_add(path_ptr, weight);
+        }
+    }
+
+    bpf_map_update_elem(&last_probe_id_map, &req, &current_probe_id, BPF_ANY);
 }
 
 /* ------------------------------------------------------------------ *
@@ -96,7 +119,7 @@ int handle_start(struct pt_regs *ctx)
     bpf_map_update_elem(&active_requests, &tid, &request_id, BPF_ANY);
 
     /* Seed the first IP for this request */
-    track_edge(ctx);
+    track_edge(ctx, 1);
     return 0;
 }
 
@@ -106,7 +129,7 @@ int handle_start(struct pt_regs *ctx)
 SEC("uprobe//opt/nginx/sbin/nginx:ngx_http_finalize_request")
 int handle_end(struct pt_regs *ctx)
 {
-    track_edge(ctx);
+    track_edge(ctx, 14);
 
     __u64 tid = bpf_get_current_pid_tgid();
     __u64 *req_ptr = bpf_map_lookup_elem(&active_requests, &tid);
@@ -130,7 +153,7 @@ int handle_end(struct pt_regs *ctx)
 
     /* Cleanup per-request state */
     bpf_map_delete_elem(&path_map,        &req);
-    bpf_map_delete_elem(&last_ip_map,     &req);
+    bpf_map_delete_elem(&last_probe_id_map, &req);
     bpf_map_delete_elem(&active_requests, &tid);
     return 0;
 }
@@ -141,24 +164,43 @@ int handle_end(struct pt_regs *ctx)
 
 /* Always called for every request — phases dispatcher */
 SEC("uprobe//opt/nginx/sbin/nginx:ngx_http_core_run_phases")
-int handle_edge1(struct pt_regs *ctx) { track_edge(ctx); return 0; }
+int handle_edge1(struct pt_regs *ctx) { track_edge(ctx, 2); return 0; }
 
 /* Called for every request before content phase */
 SEC("uprobe//opt/nginx/sbin/nginx:ngx_http_handler")
-int handle_edge2(struct pt_regs *ctx) { track_edge(ctx); return 0; }
+int handle_edge2(struct pt_regs *ctx) { track_edge(ctx, 3); return 0; }
 
 /* Called for every request — generic phase runner */
 SEC("uprobe//opt/nginx/sbin/nginx:ngx_http_core_generic_phase")
-int handle_edge3(struct pt_regs *ctx) { track_edge(ctx); return 0; }
+int handle_edge3(struct pt_regs *ctx) { track_edge(ctx, 4); return 0; }
 
 /* Content phase handler — key dispatch point for 200 vs 404 */
 SEC("uprobe//opt/nginx/sbin/nginx:ngx_http_core_content_phase")
-int handle_edge4(struct pt_regs *ctx) { track_edge(ctx); return 0; }
+int handle_edge4(struct pt_regs *ctx) { track_edge(ctx, 5); return 0; }
 
 /* Called only when serving static files (200 path) */
 SEC("uprobe//opt/nginx/sbin/nginx:ngx_http_static_handler")
-int handle_edge5(struct pt_regs *ctx) { track_edge(ctx); return 0; }
+int handle_edge5(struct pt_regs *ctx) { track_edge(ctx, 6); return 0; }
 
 /* Called on the 200 output path — NOT called for plain 404 */
 SEC("uprobe//opt/nginx/sbin/nginx:ngx_http_output_filter")
-int handle_edge6(struct pt_regs *ctx) { track_edge(ctx); return 0; }
+int handle_edge6(struct pt_regs *ctx) { track_edge(ctx, 7); return 0; }
+
+/* Shared Library uprobes */
+SEC("uprobe//lib/x86_64-linux-gnu/libc.so.6:read")
+int handle_libc_read(struct pt_regs *ctx) { track_edge(ctx, 8); return 0; }
+
+SEC("uprobe//lib/x86_64-linux-gnu/libc.so.6:write")
+int handle_libc_write(struct pt_regs *ctx) { track_edge(ctx, 9); return 0; }
+
+SEC("uprobe//lib/x86_64-linux-gnu/libc.so.6:recv")
+int handle_libc_recv(struct pt_regs *ctx) { track_edge(ctx, 10); return 0; }
+
+SEC("uprobe//lib/x86_64-linux-gnu/libc.so.6:send")
+int handle_libc_send(struct pt_regs *ctx) { track_edge(ctx, 11); return 0; }
+
+SEC("uprobe//lib/x86_64-linux-gnu/libc.so.6:pread")
+int handle_libc_pread(struct pt_regs *ctx) { track_edge(ctx, 12); return 0; }
+
+SEC("uprobe//lib/x86_64-linux-gnu/libc.so.6:pwrite")
+int handle_libc_pwrite(struct pt_regs *ctx) { track_edge(ctx, 13); return 0; }
