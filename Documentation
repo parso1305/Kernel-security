@@ -1,8 +1,0 @@
-## 📄 Documentation
-
-- 📘 [Research Report (PDF)](documentation/StreamAttest_Report.pdf)
-
-This document describes:
-- Phase-wise implementation (Epoch → Path → CFG → Attestation)
-- Design decisions and challenges
-- Security analysis and evaluation
